@@ -200,6 +200,11 @@ func TestMySQLTransactionIncludesAuthenticatedUsername(t *testing.T) {
 	assert.NoError(t, err)
 	assert.Equal(t, "audit_reader", username)
 
+	// Simulate a TCP reassembly gap: the TCP layer drops protocol-private
+	// state, while the connection tuple remains stable. The next SQL command
+	// must restore the authenticated username from the connection cache.
+	private = nil
+
 	// A second SQL transaction on the same TCP connection must reuse the
 	// username captured during the initial authentication handshake.
 	private = mysql.Parse(&protos.Packet{

@@ -29,13 +29,15 @@ type mysqlConfig struct {
 	MaxRowLength          int           `config:"max_row_length"`
 	MaxRows               int           `config:"max_rows"`
 	StatementTimeout      time.Duration `config:"statement_timeout"`
+	ConnectionTimeout     time.Duration `config:"connection_timeout"`
 }
 
 var defaultConfig = mysqlConfig{
 	ProtocolCommon: config.ProtocolCommon{
 		TransactionTimeout: protos.DefaultTransactionExpiration,
 	},
-	MaxRowLength:     1024,
-	MaxRows:          10,
-	StatementTimeout: 3600 * time.Second,
+	MaxRowLength:      1024,
+	MaxRows:           10,
+	StatementTimeout:  3600 * time.Second,
+	ConnectionTimeout: 8 * time.Hour,
 }

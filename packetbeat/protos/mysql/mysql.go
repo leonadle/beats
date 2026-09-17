@@ -168,6 +168,8 @@ type mysqlPlugin struct {
 
 	transactions       *common.Cache
 	transactionTimeout time.Duration
+	connectionTimeout  time.Duration
+	authenticatedUsers *common.Cache
 
 	// prepare statements cache
 	prepareStatements       *common.Cache
@@ -218,6 +220,10 @@ func (mysql *mysqlPlugin) init(results protos.Reporter, watcher *procs.Processes
 		mysql.transactionTimeout,
 		protos.DefaultTransactionHashSize)
 	mysql.transactions.StartJanitor(mysql.transactionTimeout)
+	mysql.authenticatedUsers = common.NewCache(
+		mysql.connectionTimeout,
+		protos.DefaultTransactionHashSize)
+	mysql.authenticatedUsers.StartJanitor(mysql.connectionTimeout)
 
 	// prepare statements cache
 	mysql.prepareStatements = common.NewCache(
@@ -240,11 +246,13 @@ func (mysql *mysqlPlugin) setFromConfig(config *mysqlConfig) {
 	mysql.sendResponse = config.SendResponse
 	mysql.transactionTimeout = config.TransactionTimeout
 	mysql.prepareStatementTimeout = config.StatementTimeout
+	mysql.connectionTimeout = config.ConnectionTimeout
 }
 
 func (mysql *mysqlPlugin) Close() {
 	mysql.transactions.StopJanitor()
 	mysql.prepareStatements.StopJanitor()
+	mysql.authenticatedUsers.StopJanitor()
 }
 
 func (mysql *mysqlPlugin) getTransaction(k common.HashableTCPTuple) *mysqlTransaction {
@@ -622,8 +630,18 @@ type mysqlPrivateData struct {
 func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, stream *mysqlStream) {
 	// all ok, ship it
 	msg := stream.data[stream.message.start:stream.message.end]
+	if !stream.isClient && stream.message.seq == 0 &&
+		(stream.message.typ == 0x09 || stream.message.typ == 0x0a) {
+		// A server greeting starts a fresh MySQL session, so do not reuse an
+		// identity retained for an older session with the same tuple.
+		mysql.authenticatedUsers.Delete(tcptuple.Hashable())
+		stream.auth.username = ""
+	}
 	if stream.auth != nil {
 		stream.message.username = stream.auth.username
+		if stream.auth.username != "" {
+			mysql.authenticatedUsers.Put(tcptuple.Hashable(), stream.auth.username)
+		}
 	}
 
 	if !stream.message.ignoreMessage {
@@ -635,7 +653,7 @@ func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, 
 }
 
 func (mysql *mysqlPlugin) ConnectionTimeout() time.Duration {
-	return mysql.transactionTimeout
+	return mysql.connectionTimeout
 }
 
 func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
@@ -651,6 +669,9 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 	}
 	if priv.auth == nil {
 		priv.auth = &mysqlAuthState{}
+		if username, ok := mysql.authenticatedUsers.Get(tcptuple.Hashable()).(string); ok {
+			priv.auth.username = username
+		}
 	}
 
 	if priv.data[dir] == nil {
@@ -733,6 +754,7 @@ func (mysql *mysqlPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 func (mysql *mysqlPlugin) ReceivedFin(tcptuple *common.TCPTuple, dir uint8,
 	private protos.ProtocolData,
 ) protos.ProtocolData {
+	mysql.authenticatedUsers.Delete(tcptuple.Hashable())
 	// TODO: check if we have data pending and either drop it to free
 	// memory or send it up the stack.
 	return private
