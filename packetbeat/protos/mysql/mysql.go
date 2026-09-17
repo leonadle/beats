@@ -314,8 +314,11 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 		case mysqlStateStart:
 			m.start = s.parseOffset
 			if len(s.data[s.parseOffset:]) < 5 {
-				s.logger.Warnf("MySQL Message too short. Ignore it.")
-				return false, false
+				// A MySQL packet header can span TCP segments. Keep the
+				// buffered bytes and wait for the next segment instead of
+				// dropping this direction of the stream. In particular, dropping
+				// a split Handshake Response loses the authenticated username.
+				return true, false
 			}
 			hdr := s.data[s.parseOffset : s.parseOffset+5]
 			m.packetLength = leUint24(hdr[0:3])

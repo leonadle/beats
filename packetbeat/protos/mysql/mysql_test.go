@@ -143,6 +143,22 @@ func TestMySQLParser_simpleRequest(t *testing.T) {
 	}
 }
 
+func TestMySQLParserWaitsForSplitPacketHeader(t *testing.T) {
+	fullPacket := mysqlWirePacket(0, []byte{mysqlCmdQuery, 'S', 'E', 'L', 'E', 'C', 'T', ' ', '1'})
+	stream := newTestMySQLStream(fullPacket[:4], true)
+
+	ok, complete := mysqlMessageParser(stream)
+	assert.True(t, ok)
+	assert.False(t, complete)
+	assert.Equal(t, 0, stream.parseOffset)
+
+	stream.data = append(stream.data, fullPacket[4:]...)
+	ok, complete = mysqlMessageParser(stream)
+	assert.True(t, ok)
+	assert.True(t, complete)
+	assert.Equal(t, "SELECT 1", stream.message.query)
+}
+
 func TestParseHandshakeResponseUsername(t *testing.T) {
 	username, ok := parseHandshakeResponseUsername(mysqlHandshakeResponsePacket("audit_reader"))
 	assert.True(t, ok)
@@ -163,8 +179,14 @@ func TestMySQLTransactionIncludesAuthenticatedUsername(t *testing.T) {
 	private = mysql.Parse(&protos.Packet{
 		Payload: mysqlWirePacket(0, []byte{0x0a, 0x00}),
 	}, tuple, tcp.TCPDirectionReverse, private)
+	// The handshake response can be split before its final header byte.
+	// It must remain buffered so the following segment still yields a username.
+	handshakeResponse := mysqlHandshakeResponsePacket("audit_reader")
 	private = mysql.Parse(&protos.Packet{
-		Payload: mysqlHandshakeResponsePacket("audit_reader"),
+		Payload: handshakeResponse[:4],
+	}, tuple, tcp.TCPDirectionOriginal, private)
+	private = mysql.Parse(&protos.Packet{
+		Payload: handshakeResponse[4:],
 	}, tuple, tcp.TCPDirectionOriginal, private)
 	private = mysql.Parse(&protos.Packet{
 		Payload: mysqlWirePacket(0, append([]byte{mysqlCmdQuery}, []byte("SELECT 1")...)),
