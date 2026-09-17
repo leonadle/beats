@@ -169,12 +169,26 @@ func TestMySQLTransactionIncludesAuthenticatedUsername(t *testing.T) {
 	private = mysql.Parse(&protos.Packet{
 		Payload: mysqlWirePacket(0, append([]byte{mysqlCmdQuery}, []byte("SELECT 1")...)),
 	}, tuple, tcp.TCPDirectionOriginal, private)
-	mysql.Parse(&protos.Packet{
+	private = mysql.Parse(&protos.Packet{
 		Payload: []byte{0x07, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00},
 	}, tuple, tcp.TCPDirectionReverse, private)
 
 	transaction := expectTransaction(t, store)
 	username, err := transaction.GetValue("user.name")
+	assert.NoError(t, err)
+	assert.Equal(t, "audit_reader", username)
+
+	// A second SQL transaction on the same TCP connection must reuse the
+	// username captured during the initial authentication handshake.
+	private = mysql.Parse(&protos.Packet{
+		Payload: mysqlWirePacket(0, append([]byte{mysqlCmdQuery}, []byte("SELECT 2")...)),
+	}, tuple, tcp.TCPDirectionOriginal, private)
+	mysql.Parse(&protos.Packet{
+		Payload: []byte{0x07, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00},
+	}, tuple, tcp.TCPDirectionReverse, private)
+
+	transaction = expectTransaction(t, store)
+	username, err = transaction.GetValue("user.name")
 	assert.NoError(t, err)
 	assert.Equal(t, "audit_reader", username)
 }
