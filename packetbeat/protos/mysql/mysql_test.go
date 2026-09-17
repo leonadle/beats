@@ -72,10 +72,30 @@ func newTestMySQLStream(data []byte, isClient bool) *mysqlStream {
 		data:           data,
 		message:        new(mysqlMessage),
 		isClient:       isClient,
+		auth:           &mysqlAuthState{},
 		logger:         logger,
 		mysqlLogger:    logger.Named("mysql"),
 		mysqlDetLogger: logger.Named("mysql.detail"),
 	}
+}
+
+func mysqlWirePacket(sequence uint8, payload []byte) []byte {
+	packet := make([]byte, 4+len(payload))
+	packet[0] = byte(len(payload))
+	packet[1] = byte(len(payload) >> 8)
+	packet[2] = byte(len(payload) >> 16)
+	packet[3] = sequence
+	copy(packet[4:], payload)
+	return packet
+}
+
+func mysqlHandshakeResponsePacket(username string) []byte {
+	// capability flags (4), max packet size (4), character set (1), and
+	// reserved bytes (23) precede the null-terminated username.
+	payload := make([]byte, 4+4+1+23)
+	payload = append(payload, username...)
+	payload = append(payload, 0x00, 0x00) // username terminator and empty auth response
+	return mysqlWirePacket(1, payload)
 }
 
 func Test_parseStateNames(t *testing.T) {
@@ -121,6 +141,42 @@ func TestMySQLParser_simpleRequest(t *testing.T) {
 	if stream.message.size != 115 {
 		t.Errorf("Wrong message size %d", stream.message.size)
 	}
+}
+
+func TestParseHandshakeResponseUsername(t *testing.T) {
+	username, ok := parseHandshakeResponseUsername(mysqlHandshakeResponsePacket("audit_reader"))
+	assert.True(t, ok)
+	assert.Equal(t, "audit_reader", username)
+
+	// SSLRequest has only the fixed 32-byte payload and therefore no username.
+	_, ok = parseHandshakeResponseUsername(mysqlWirePacket(1, make([]byte, 32)))
+	assert.False(t, ok)
+}
+
+func TestMySQLTransactionIncludesAuthenticatedUsername(t *testing.T) {
+	store := &eventStore{}
+	mysql := mysqlModForTests(store)
+	tuple := testTCPTuple()
+	var private protos.ProtocolData
+
+	// Server greeting enables authentication parsing for the next client packet.
+	private = mysql.Parse(&protos.Packet{
+		Payload: mysqlWirePacket(0, []byte{0x0a, 0x00}),
+	}, tuple, tcp.TCPDirectionReverse, private)
+	private = mysql.Parse(&protos.Packet{
+		Payload: mysqlHandshakeResponsePacket("audit_reader"),
+	}, tuple, tcp.TCPDirectionOriginal, private)
+	private = mysql.Parse(&protos.Packet{
+		Payload: mysqlWirePacket(0, append([]byte{mysqlCmdQuery}, []byte("SELECT 1")...)),
+	}, tuple, tcp.TCPDirectionOriginal, private)
+	mysql.Parse(&protos.Packet{
+		Payload: []byte{0x07, 0x00, 0x00, 0x01, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00},
+	}, tuple, tcp.TCPDirectionReverse, private)
+
+	transaction := expectTransaction(t, store)
+	username, err := transaction.GetValue("user.name")
+	assert.NoError(t, err)
+	assert.Equal(t, "audit_reader", username)
 }
 
 func TestMySQLParser_OKResponse(t *testing.T) {

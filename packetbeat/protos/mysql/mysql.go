@@ -18,6 +18,7 @@
 package mysql
 
 import (
+	"bytes"
 	"encoding/binary"
 	"errors"
 	"fmt"
@@ -74,6 +75,10 @@ type mysqlMessage struct {
 	errorInfo      string
 	query          string
 	ignoreMessage  bool
+	// isHandshakeResponse is set for the initial client authentication packet.
+	// It is not a MySQL command and must not become a transaction.
+	isHandshakeResponse bool
+	username            string
 
 	direction    uint8
 	isTruncated  bool
@@ -99,6 +104,7 @@ type mysqlTransaction struct {
 	bytesIn  uint64
 	notes    []string
 	isError  bool
+	username string
 
 	mysql mapstr.M
 
@@ -115,9 +121,18 @@ type mysqlStream struct {
 	parseOffset int
 	parseState  parseState
 	isClient    bool
+	auth        *mysqlAuthState
 
 	message                             *mysqlMessage
 	logger, mysqlLogger, mysqlDetLogger *logp.Logger
+}
+
+// mysqlAuthState is shared by both directions of one TCP connection. MySQL
+// sends the authenticated account only during the connection phase, so SQL
+// command packets must obtain it from this connection-scoped state.
+type mysqlAuthState struct {
+	awaitingHandshakeResponse bool
+	username                  string
 }
 
 type parseState int
@@ -309,10 +324,22 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 
 			s.mysqlLogger.Debugf("MySQL Header: Packet length %d, Seq %d, Type=%d isClient=%v", m.packetLength, m.seq, m.typ, s.isClient)
 
+			// The initial server greeting has sequence ID 0 and begins with the
+			// protocol version (9 or 10). Only parse a following sequence ID 1
+			// client packet as authentication when that greeting was observed. This
+			// prevents treating a packet from a mid-stream capture as credentials.
+			if !s.isClient && s.auth != nil && m.seq == 0 && (m.typ == 0x09 || m.typ == 0x0a) {
+				s.auth.awaitingHandshakeResponse = true
+			}
+
 			if s.isClient {
 				// starts Command Phase
 
-				if m.seq == 0 && isRequest(m.typ) {
+				if s.auth != nil && s.auth.awaitingHandshakeResponse && m.seq == 1 {
+					m.isHandshakeResponse = true
+					m.ignoreMessage = true
+					s.parseState = mysqlStateEatMessage
+				} else if m.seq == 0 && isRequest(m.typ) {
 					// parse request
 					m.isRequest = true
 					m.start = s.parseOffset
@@ -358,7 +385,13 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			s.parseOffset += 4 // header
 			s.parseOffset += int(m.packetLength)
 			m.end = s.parseOffset
-			if m.isRequest {
+			if m.isHandshakeResponse {
+				if username, ok := parseHandshakeResponseUsername(s.data[m.start:m.end]); ok {
+					s.auth.username = username
+				}
+				// An SSLRequest has no username and is intentionally left empty.
+				s.auth.awaitingHandshakeResponse = false
+			} else if m.isRequest {
 				// get the statement id
 				if m.typ == mysqlCmdStmtExecute || m.typ == mysqlCmdStmtClose {
 					if len(s.data[m.start+5:]) < 4 {
@@ -579,12 +612,16 @@ func (mysql *mysqlPlugin) messageGap(s *mysqlStream, nbytes int) (complete bool)
 
 type mysqlPrivateData struct {
 	data [2]*mysqlStream
+	auth *mysqlAuthState
 }
 
 // Called when the parser has identified a full message.
 func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, stream *mysqlStream) {
 	// all ok, ship it
 	msg := stream.data[stream.message.start:stream.message.end]
+	if stream.auth != nil {
+		stream.message.username = stream.auth.username
+	}
 
 	if !stream.message.ignoreMessage {
 		mysql.handleMysql(mysql, stream.message, tcptuple, dir, msg)
@@ -609,6 +646,9 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 			priv = mysqlPrivateData{}
 		}
 	}
+	if priv.auth == nil {
+		priv.auth = &mysqlAuthState{}
+	}
 
 	if priv.data[dir] == nil {
 		dstPort := tcptuple.DstPort
@@ -619,6 +659,7 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 			data:           pkt.Payload,
 			message:        &mysqlMessage{ts: pkt.Ts},
 			isClient:       mysql.isServerPort(dstPort),
+			auth:           priv.auth,
 			logger:         mysql.logger,
 			mysqlLogger:    mysql.mysqlLogger,
 			mysqlDetLogger: mysql.mysqlDetLogger,
@@ -723,6 +764,7 @@ func (mysql *mysqlPlugin) receivedMysqlRequest(msg *mysqlMessage) {
 	}
 
 	trans.ts = msg.ts
+	trans.username = msg.username
 	trans.src, trans.dst = common.MakeEndpointPair(msg.tcpTuple.BaseTuple, msg.cmdlineTuple)
 	if msg.direction == tcp.TCPDirectionReverse {
 		trans.src, trans.dst = trans.dst, trans.src
@@ -1261,6 +1303,10 @@ func (mysql *mysqlPlugin) publishTransaction(t *mysqlTransaction) {
 	fields["method"] = t.method
 	fields["query"] = t.query
 	fields["mysql"] = t.mysql
+	if t.username != "" {
+		fields["user"] = mapstr.M{"name": t.username}
+		pbf.AddUser(t.username)
+	}
 	if len(t.path) > 0 {
 		fields["path"] = t.path
 	}
@@ -1282,6 +1328,25 @@ func (mysql *mysqlPlugin) publishTransaction(t *mysqlTransaction) {
 	}
 
 	mysql.results(evt)
+}
+
+// parseHandshakeResponseUsername extracts username from a Protocol::HandshakeResponse41
+// packet. raw includes the four-byte MySQL packet header. The username starts after
+// capability flags, max packet size, character set, and 23 reserved bytes, and is
+// null-terminated. It is deliberately parsed before any authentication data.
+func parseHandshakeResponseUsername(raw []byte) (string, bool) {
+	const usernameOffset = 4 + 4 + 4 + 1 + 23
+
+	if len(raw) <= usernameOffset {
+		return "", false
+	}
+
+	end := bytes.IndexByte(raw[usernameOffset:], 0x00)
+	if end <= 0 {
+		return "", false
+	}
+
+	return string(raw[usernameOffset : usernameOffset+end]), true
 }
 
 func readLstring(data []byte, offset int) ([]byte, int, bool, error) {
