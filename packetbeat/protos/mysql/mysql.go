@@ -223,7 +223,8 @@ func (mysql *mysqlPlugin) init(results protos.Reporter, watcher *procs.Processes
 	mysql.authenticatedUsers = common.NewCache(
 		mysql.connectionTimeout,
 		protos.DefaultTransactionHashSize)
-	mysql.authenticatedUsers.StartJanitor(mysql.connectionTimeout)
+	// Sweep frequently while each entry still uses connection_timeout as its TTL.
+	mysql.authenticatedUsers.StartJanitor(time.Minute)
 
 	// prepare statements cache
 	mysql.prepareStatements = common.NewCache(
@@ -290,7 +291,13 @@ func (mysql *mysqlPlugin) GetPorts() []int {
 }
 
 func (stream *mysqlStream) prepareForNewMessage() {
-	stream.data = stream.data[stream.parseOffset:]
+	remaining := stream.data[stream.parseOffset:]
+	if len(remaining) == 0 {
+		stream.data = nil
+	} else {
+		// Copy the tail so it cannot retain a large consumed backing buffer.
+		stream.data = append([]byte(nil), remaining...)
+	}
 	stream.parseState = mysqlStateStart
 	stream.parseOffset = 0
 	stream.message = nil
@@ -303,6 +310,15 @@ func (mysql *mysqlPlugin) isServerPort(port uint16) bool {
 		}
 	}
 	return false
+}
+
+// authenticatedUserKey omits StreamID so identity survives TCP reassembly expiry.
+func (mysql *mysqlPlugin) authenticatedUserKey(tcptuple *common.TCPTuple) common.HashableIPPortTuple {
+	tuple := tcptuple.IPPort()
+	if mysql.isServerPort(tuple.DstPort) {
+		return tuple.Hashable()
+	}
+	return tuple.RevHashable()
 }
 
 func isRequest(typ uint8) bool {
@@ -634,13 +650,13 @@ func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, 
 		(stream.message.typ == 0x09 || stream.message.typ == 0x0a) {
 		// A server greeting starts a fresh MySQL session, so do not reuse an
 		// identity retained for an older session with the same tuple.
-		mysql.authenticatedUsers.Delete(tcptuple.Hashable())
+		mysql.authenticatedUsers.Delete(mysql.authenticatedUserKey(tcptuple))
 		stream.auth.username = ""
 	}
 	if stream.auth != nil {
 		stream.message.username = stream.auth.username
 		if stream.auth.username != "" {
-			mysql.authenticatedUsers.Put(tcptuple.Hashable(), stream.auth.username)
+			mysql.authenticatedUsers.Put(mysql.authenticatedUserKey(tcptuple), stream.auth.username)
 		}
 	}
 
@@ -653,7 +669,8 @@ func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, 
 }
 
 func (mysql *mysqlPlugin) ConnectionTimeout() time.Duration {
-	return mysql.connectionTimeout
+	// Keep heavyweight reassembly short-lived; username state has its own TTL.
+	return mysql.transactionTimeout
 }
 
 func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
@@ -669,7 +686,7 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 	}
 	if priv.auth == nil {
 		priv.auth = &mysqlAuthState{}
-		if username, ok := mysql.authenticatedUsers.Get(tcptuple.Hashable()).(string); ok {
+		if username, ok := mysql.authenticatedUsers.Get(mysql.authenticatedUserKey(tcptuple)).(string); ok {
 			priv.auth.username = username
 		}
 	}
@@ -754,7 +771,7 @@ func (mysql *mysqlPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 func (mysql *mysqlPlugin) ReceivedFin(tcptuple *common.TCPTuple, dir uint8,
 	private protos.ProtocolData,
 ) protos.ProtocolData {
-	mysql.authenticatedUsers.Delete(tcptuple.Hashable())
+	mysql.authenticatedUsers.Delete(mysql.authenticatedUserKey(tcptuple))
 	// TODO: check if we have data pending and either drop it to free
 	// memory or send it up the stack.
 	return private
