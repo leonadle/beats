@@ -70,6 +70,35 @@ func TestPrepareForNewMessageReleasesConsumedBuffer(t *testing.T) {
 	}
 }
 
+func TestCompactParsedResponseReleasesConsumedBuffer(t *testing.T) {
+	const captured = "captured-response"
+	const tail = "next-packet"
+	bufferSize := 2 * mysqlStreamCompactThreshold
+	data := make([]byte, bufferSize)
+	copy(data, captured)
+	copy(data[bufferSize-len(tail):], tail)
+	parseOffset := bufferSize - len(tail)
+	message := &mysqlMessage{end: len(captured)}
+	stream := mysqlStream{
+		data:        data,
+		parseOffset: parseOffset,
+		parseState:  mysqlStateEatRows,
+		message:     message,
+	}
+
+	stream.compactParsedResponse()
+
+	if got, want := string(stream.data), captured+tail; got != want {
+		t.Fatalf("retained bytes changed: got %q, want %q", got, want)
+	}
+	if cap(stream.data) >= mysqlStreamCompactThreshold {
+		t.Fatalf("compaction retained a large backing buffer: cap=%d", cap(stream.data))
+	}
+	if got, want := stream.parseOffset, message.end; got != want {
+		t.Fatalf("parse offset=%d, want %d", got, want)
+	}
+}
+
 func TestConnectionTimeoutOnlyRetainsReassemblyForTransaction(t *testing.T) {
 	mysql := mysqlPlugin{
 		transactionTimeout: 10 * time.Second,

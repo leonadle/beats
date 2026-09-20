@@ -48,8 +48,9 @@ const (
 )
 
 const (
-	maxPayloadSize            = 100 * 1024
-	clientDeprecateEOF uint32 = 1 << 24
+	maxPayloadSize                     = 100 * 1024
+	clientDeprecateEOF          uint32 = 1 << 24
+	mysqlStreamCompactThreshold        = maxPayloadSize
 )
 
 var (
@@ -311,6 +312,22 @@ func (stream *mysqlStream) prepareForNewMessage() {
 	stream.parseState = mysqlStateStart
 	stream.parseOffset = 0
 	stream.message = nil
+}
+
+// compactParsedResponse bounds the per-connection buffer while a large result set is still in flight.
+func (stream *mysqlStream) compactParsedResponse() {
+	message := stream.message
+	if stream.parseState != mysqlStateEatRows || message == nil || message.end == 0 ||
+		stream.parseOffset-message.end < mysqlStreamCompactThreshold {
+		return
+	}
+
+	tail := stream.data[stream.parseOffset:]
+	data := make([]byte, message.end+len(tail))
+	copy(data, stream.data[:message.end])
+	copy(data[message.end:], tail)
+	stream.data = data
+	stream.parseOffset = message.end
 }
 
 func (mysql *mysqlPlugin) isServerPort(port uint16) bool {
@@ -624,6 +641,7 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 				m.end = s.parseOffset
 			}
 			m.numberOfRows++
+			s.compactParsedResponse()
 			// go to next row
 		}
 	}
