@@ -47,7 +47,10 @@ const (
 	mysqlCmdStmtClose   = 25
 )
 
-const maxPayloadSize = 100 * 1024
+const (
+	maxPayloadSize            = 100 * 1024
+	clientDeprecateEOF uint32 = 1 << 24
+)
 
 var (
 	unmatchedRequests  = monitoring.NewInt(nil, "mysql.unmatched_requests")
@@ -65,6 +68,7 @@ type mysqlMessage struct {
 	typ            uint8
 	numberOfRows   int
 	numberOfFields int
+	fieldsRead     int
 	size           uint64
 	tables         string
 	isOK           bool
@@ -133,6 +137,12 @@ type mysqlStream struct {
 type mysqlAuthState struct {
 	awaitingHandshakeResponse bool
 	username                  string
+	clientCapabilities        uint32
+}
+
+type mysqlConnectionIdentity struct {
+	username           string
+	clientCapabilities uint32
 }
 
 type parseState int
@@ -413,6 +423,9 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			s.parseOffset += int(m.packetLength)
 			m.end = s.parseOffset
 			if m.isHandshakeResponse {
+				if capabilities, ok := parseHandshakeResponseCapabilities(s.data[m.start:m.end]); ok {
+					s.auth.clientCapabilities = capabilities
+				}
 				if username, ok := parseHandshakeResponseUsername(s.data[m.start:m.end]); ok {
 					s.auth.username = username
 				}
@@ -549,6 +562,10 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 					}
 					s.mysqlDetLogger.Debugf("db=%s, table=%s", db, table)
 					s.parseOffset += int(m.packetLength)
+					m.fieldsRead++
+					if s.auth != nil && s.auth.clientCapabilities&clientDeprecateEOF != 0 && m.fieldsRead >= m.numberOfFields {
+						s.parseState = mysqlStateEatRows
+					}
 					// go to next field
 				}
 			} else {
@@ -656,7 +673,9 @@ func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, 
 	if stream.auth != nil {
 		stream.message.username = stream.auth.username
 		if stream.auth.username != "" {
-			mysql.authenticatedUsers.Put(mysql.authenticatedUserKey(tcptuple), stream.auth.username)
+			mysql.authenticatedUsers.Put(mysql.authenticatedUserKey(tcptuple), mysqlConnectionIdentity{
+				username: stream.auth.username, clientCapabilities: stream.auth.clientCapabilities,
+			})
 		}
 	}
 
@@ -686,8 +705,9 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 	}
 	if priv.auth == nil {
 		priv.auth = &mysqlAuthState{}
-		if username, ok := mysql.authenticatedUsers.Get(mysql.authenticatedUserKey(tcptuple)).(string); ok {
-			priv.auth.username = username
+		if identity, ok := mysql.authenticatedUsers.Get(mysql.authenticatedUserKey(tcptuple)).(mysqlConnectionIdentity); ok {
+			priv.auth.username = identity.username
+			priv.auth.clientCapabilities = identity.clientCapabilities
 		}
 	}
 
@@ -1376,6 +1396,14 @@ func (mysql *mysqlPlugin) publishTransaction(t *mysqlTransaction) {
 // packet. raw includes the four-byte MySQL packet header. The username starts after
 // capability flags, max packet size, character set, and 23 reserved bytes, and is
 // null-terminated. It is deliberately parsed before any authentication data.
+func parseHandshakeResponseCapabilities(raw []byte) (uint32, bool) {
+	const capabilitiesOffset = 4
+	if len(raw) < capabilitiesOffset+4 {
+		return 0, false
+	}
+	return binary.LittleEndian.Uint32(raw[capabilitiesOffset : capabilitiesOffset+4]), true
+}
+
 func parseHandshakeResponseUsername(raw []byte) (string, bool) {
 	const usernameOffset = 4 + 4 + 4 + 1 + 23
 
