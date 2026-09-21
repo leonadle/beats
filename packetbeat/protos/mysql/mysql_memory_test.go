@@ -114,6 +114,27 @@ func TestShortResponseDoesNotReadCoalescedNextPacket(t *testing.T) {
 	}
 }
 
+func TestTwelveByteOKIsNotMistakenForPrepareResponse(t *testing.T) {
+	payload := append([]byte{0, 0, 0, 2, 0, 0, 0}, []byte("hello")...)
+	stream := newTestMySQLStream(mysqlWirePacket(1, payload), false)
+	stream.auth.lastCommand = mysqlCmdQuery
+	ok, complete := mysqlMessageParser(stream)
+	require.True(t, ok, "ordinary OK with an info string must parse")
+	assert.True(t, complete, "ordinary OK must not await prepared-statement metadata")
+	assert.Zero(t, stream.message.statementID, "ordinary OK must not create a prepared statement")
+}
+
+func TestPrepareWithNoMetadataCompletes(t *testing.T) {
+	payload := make([]byte, 12)
+	payload[1] = 1
+	stream := newTestMySQLStream(mysqlWirePacket(1, payload), false)
+	stream.auth.lastCommand = mysqlCmdStmtPrepare
+	ok, complete := mysqlMessageParser(stream)
+	require.True(t, ok, "PREPARE_OK with no metadata must parse")
+	assert.True(t, complete, "zero-field zero-parameter prepare must not pin a stream waiting forever")
+	assert.Equal(t, 1, stream.message.statementID, "prepare statement ID must be preserved")
+}
+
 func TestPrepareForNewMessageReleasesConsumedBuffer(t *testing.T) {
 	const bufferSize = 1 << 20
 	stream := mysqlStream{

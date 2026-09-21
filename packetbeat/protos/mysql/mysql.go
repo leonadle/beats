@@ -90,6 +90,7 @@ type mysqlMessage struct {
 	// It is not a MySQL command and must not become a transaction.
 	isHandshakeResponse bool
 	isServerGreeting    bool
+	isPrepareResponse   bool
 	username            string
 
 	direction    uint8
@@ -147,6 +148,7 @@ type mysqlAuthState struct {
 	awaitingHandshakeResponse bool
 	username                  string
 	clientCapabilities        uint32
+	lastCommand               uint8
 }
 
 type mysqlConnectionIdentity struct {
@@ -427,6 +429,9 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			m.packetLength = leUint24(hdr[0:3])
 			m.seq = hdr[3]
 			m.typ = hdr[4]
+			m.isPrepareResponse = !s.isClient && s.auth != nil &&
+				s.auth.lastCommand == mysqlCmdStmtPrepare && m.seq == 1 &&
+				m.typ == 0x00 && m.packetLength == 12
 
 			s.mysqlLogger.Debugf("MySQL Header: Packet length %d, Seq %d, Type=%d isClient=%v", m.packetLength, m.seq, m.typ, s.isClient)
 
@@ -565,9 +570,9 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			s.mysqlDetLogger.Debugf("Message complete. remaining=%d",
 				len(s.data[s.parseOffset:]))
 
-			// PREPARE_OK packet for Prepared Statement
-			// a trick for classify special OK packet
-			if m.isOK && m.packetLength == 12 {
+			// Packet length alone cannot distinguish PREPARE_OK from an
+			// ordinary OK packet carrying a five-byte info string.
+			if m.isPrepareResponse {
 				m.statementID = int(binary.LittleEndian.Uint32(s.data[m.start+5:]))
 				m.numberOfFields = int(binary.LittleEndian.Uint16(s.data[m.start+9:]))
 				m.numberOfParams = int(binary.LittleEndian.Uint16(s.data[m.start+11:]))
@@ -575,6 +580,8 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 					s.parseState = mysqlStateEatFields
 				} else if m.numberOfParams > 0 {
 					s.parseState = mysqlStateEatRows
+				} else {
+					return true, true
 				}
 			} else {
 				return true, true
@@ -745,6 +752,9 @@ func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, 
 		stream.auth.username = ""
 	}
 	if stream.auth != nil {
+		if stream.message.isRequest {
+			stream.auth.lastCommand = stream.message.typ
+		}
 		stream.message.username = stream.auth.username
 		if stream.auth.username != "" {
 			mysql.authenticatedUsers.Put(mysql.authenticatedUserKey(tcptuple), mysqlConnectionIdentity{

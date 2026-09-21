@@ -778,14 +778,15 @@ func Test_PreparedStatement(t *testing.T) {
 	tcpTuple := testTCPTuple()
 	results := &eventStore{}
 	mysql := mysqlModForTests(results)
+	t.Cleanup(mysql.Close)
+	var private protos.ProtocolData
 
 	send := func(dir uint8, data string) {
 		rawData, err := hex.DecodeString(data)
 		assert.NoError(t, err)
 		packet := protos.Packet{Payload: rawData}
 
-		var private protos.ProtocolData
-		mysql.Parse(&packet, tcpTuple, dir, private)
+		private = mysql.Parse(&packet, tcpTuple, dir, private)
 	}
 
 	send(tcp.TCPDirectionOriginal, "c00000001673656c6563742064697374696e637420636f756e742864697374696e63742070757263686173656465305f2e69642920617320636f6c5f305f305f2066726f6d2070757263686173655f64656d616e642070757263686173656465305f2077686572652070757263686173656465305f2e636861696e5f6d61737465723d3f20616e642070757263686173656465305f2e6372656174655f74696d653e3d3f20616e642070757263686173656465305f2e6372656174655f74696d653c3d3f")
