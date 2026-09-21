@@ -54,8 +54,13 @@ const (
 )
 
 var (
-	unmatchedRequests  = monitoring.NewInt(nil, "mysql.unmatched_requests")
-	unmatchedResponses = monitoring.NewInt(nil, "mysql.unmatched_responses")
+	unmatchedRequests   = monitoring.NewInt(nil, "mysql.unmatched_requests")
+	unmatchedResponses  = monitoring.NewInt(nil, "mysql.unmatched_responses")
+	largeIgnoredBuffers = monitoring.NewInt(nil, "mysql.large_buffers.ignored")
+	largeRequestBuffers = monitoring.NewInt(nil, "mysql.large_buffers.request")
+	largeMessageBuffers = monitoring.NewInt(nil, "mysql.large_buffers.message")
+	largeFieldBuffers   = monitoring.NewInt(nil, "mysql.large_buffers.fields")
+	largeRowBuffers     = monitoring.NewInt(nil, "mysql.large_buffers.rows")
 )
 
 type mysqlMessage struct {
@@ -83,6 +88,7 @@ type mysqlMessage struct {
 	// isHandshakeResponse is set for the initial client authentication packet.
 	// It is not a MySQL command and must not become a transaction.
 	isHandshakeResponse bool
+	isServerGreeting    bool
 	username            string
 
 	direction    uint8
@@ -123,10 +129,11 @@ type mysqlTransaction struct {
 type mysqlStream struct {
 	data []byte
 
-	parseOffset int
-	parseState  parseState
-	isClient    bool
-	auth        *mysqlAuthState
+	parseOffset         int
+	parseState          parseState
+	isClient            bool
+	largeBufferReported bool
+	auth                *mysqlAuthState
 
 	message                             *mysqlMessage
 	logger, mysqlLogger, mysqlDetLogger *logp.Logger
@@ -312,6 +319,27 @@ func (stream *mysqlStream) prepareForNewMessage() {
 	stream.parseState = mysqlStateStart
 	stream.parseOffset = 0
 	stream.message = nil
+	stream.largeBufferReported = false
+}
+
+// reportLargeBuffer counts each message once, without logging SQL or credentials.
+func (stream *mysqlStream) reportLargeBuffer() {
+	if len(stream.data) < 1<<20 || stream.largeBufferReported || stream.message == nil {
+		return
+	}
+	stream.largeBufferReported = true
+	switch {
+	case stream.message.ignoreMessage && !stream.message.isHandshakeResponse:
+		largeIgnoredBuffers.Add(1)
+	case stream.isClient:
+		largeRequestBuffers.Add(1)
+	case stream.parseState == mysqlStateEatFields:
+		largeFieldBuffers.Add(1)
+	case stream.parseState == mysqlStateEatRows:
+		largeRowBuffers.Add(1)
+	default:
+		largeMessageBuffers.Add(1)
+	}
 }
 
 // compactParsedResponse bounds the per-connection buffer while a large result set is still in flight.
@@ -383,6 +411,7 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			// client packet as authentication when that greeting was observed. This
 			// prevents treating a packet from a mid-stream capture as credentials.
 			if !s.isClient && s.auth != nil && m.seq == 0 && (m.typ == 0x09 || m.typ == 0x0a) {
+				m.isServerGreeting = true
 				s.auth.awaitingHandshakeResponse = true
 			}
 
@@ -681,8 +710,7 @@ type mysqlPrivateData struct {
 func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, stream *mysqlStream) {
 	// all ok, ship it
 	msg := stream.data[stream.message.start:stream.message.end]
-	if !stream.isClient && stream.message.seq == 0 &&
-		(stream.message.typ == 0x09 || stream.message.typ == 0x0a) {
+	if stream.message.isServerGreeting {
 		// A server greeting starts a fresh MySQL session, so do not reuse an
 		// identity retained for an older session with the same tuple.
 		mysql.authenticatedUsers.Delete(mysql.authenticatedUserKey(tcptuple))
@@ -746,6 +774,7 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 	} else {
 		// concatenate bytes
 		priv.data[dir].data = append(priv.data[dir].data, pkt.Payload...)
+		priv.data[dir].reportLargeBuffer()
 		if len(priv.data[dir].data) > tcp.TCPMaxDataInStream {
 			mysql.mysqlLogger.Debug("Stream data too large, dropping TCP stream")
 			priv.data[dir] = nil
