@@ -67,24 +67,25 @@ type mysqlMessage struct {
 	start int
 	end   int
 
-	ts             time.Time
-	isRequest      bool
-	packetLength   uint32
-	seq            uint8
-	typ            uint8
-	numberOfRows   int
-	numberOfFields int
-	fieldsRead     int
-	size           uint64
-	tables         string
-	isOK           bool
-	affectedRows   uint64
-	insertID       uint64
-	isError        bool
-	errorCode      uint16
-	errorInfo      string
-	query          string
-	ignoreMessage  bool
+	ts                    time.Time
+	isRequest             bool
+	packetLength          uint32
+	seq                   uint8
+	typ                   uint8
+	numberOfRows          int
+	numberOfFields        int
+	fieldsRead            int
+	size                  uint64
+	tables                string
+	isOK                  bool
+	affectedRows          uint64
+	insertID              uint64
+	isError               bool
+	errorCode             uint16
+	errorInfo             string
+	query                 string
+	ignoreMessage         bool
+	discardedMessageBytes int
 	// isHandshakeResponse is set for the initial client authentication packet.
 	// It is not a MySQL command and must not become a transaction.
 	isHandshakeResponse bool
@@ -358,6 +359,29 @@ func (stream *mysqlStream) compactParsedResponse() {
 	stream.parseOffset = message.end
 }
 
+// compactResponseMessage keeps a bounded prefix even while an individual
+// response packet is incomplete. Lengths seen after midstream capture or a gap
+// may be large; buffering their entire claimed payload pins MiBs per connection.
+// Requests are deliberately excluded so query text is never truncated here.
+func (stream *mysqlStream) compactResponseMessage() {
+	message := stream.message
+	if stream.isClient || message == nil || stream.parseState != mysqlStateEatMessage {
+		return
+	}
+	remaining := int(message.packetLength) + 4 - message.discardedMessageBytes
+	available := min(len(stream.data)-stream.parseOffset, remaining)
+	discard := available - maxPayloadSize
+	if discard <= 0 {
+		return
+	}
+	prefixEnd := stream.parseOffset + maxPayloadSize
+	tailStart := stream.parseOffset + available
+	copy(stream.data[prefixEnd:], stream.data[tailStart:])
+	stream.data = stream.data[:len(stream.data)-discard]
+	message.discardedMessageBytes += discard
+	message.isTruncated = true
+}
+
 func (mysql *mysqlPlugin) isServerPort(port uint16) bool {
 	for _, sPort := range mysql.ports {
 		if uint16(sPort) == port { //nolint: gosec // only used to eval a bool
@@ -460,13 +484,14 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			}
 
 		case mysqlStateEatMessage:
-			if len(s.data[s.parseOffset:]) < int(m.packetLength)+4 {
+			s.compactResponseMessage()
+			bufferedPacketLength := int(m.packetLength) + 4 - m.discardedMessageBytes
+			if len(s.data[s.parseOffset:]) < bufferedPacketLength {
 				// wait for more data
 				return true, false
 			}
 
-			s.parseOffset += 4 // header
-			s.parseOffset += int(m.packetLength)
+			s.parseOffset += bufferedPacketLength
 			m.end = s.parseOffset
 			if m.isHandshakeResponse {
 				if capabilities, ok := parseHandshakeResponseCapabilities(s.data[m.start:m.end]); ok {
@@ -494,9 +519,9 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 				}
 			} else if m.isOK {
 				// affected rows
-				affectedRows, off, complete, err := readLinteger(s.data, m.start+5)
+				affectedRows, off, complete, err := readLinteger(s.data[:m.end], m.start+5)
 				if !complete {
-					return true, false
+					return false, false
 				}
 				if err != nil {
 					s.mysqlLogger.Debugf("Error on read_linteger: %s", err)
@@ -505,9 +530,9 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 				m.affectedRows = affectedRows
 
 				// last insert id
-				insertID, _, complete, err := readLinteger(s.data, off)
+				insertID, _, complete, err := readLinteger(s.data[:m.end], off)
 				if !complete {
-					return true, false
+					return false, false
 				}
 				if err != nil {
 					s.mysqlLogger.Debugf("Error on read_linteger: %s", err)
@@ -520,20 +545,23 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 				// string[1] sql state marker
 				// string[5] sql state
 				// string<EOF> error message
-				if (m.start + 13) >= len(s.data) {
+				if m.start+13 > m.end {
 					s.logger.Warn("MySql Error code is the wrong size. Ignoring.")
 					return false, false
 				}
 				m.errorCode = binary.LittleEndian.Uint16(s.data[m.start+5 : m.start+7])
 
-				m.errorInfo = string(s.data[m.start+8:m.start+13]) + ": " + string(s.data[m.start+13:])
+				m.errorInfo = string(s.data[m.start+8:m.start+13]) + ": " + string(s.data[m.start+13:m.end])
 			}
 			msgSize := m.end - m.start
 			if msgSize < 0 {
 				s.logger.Warn("MySQL message size invalid. Ignoring.")
 				return false, false
 			}
-			m.size = uint64(msgSize)
+			m.size = uint64(msgSize + m.discardedMessageBytes)
+			if m.discardedMessageBytes > 0 && !m.ignoreMessage {
+				m.notes = append(m.notes, "MySQL response payload truncated to the capture limit")
+			}
 			s.mysqlDetLogger.Debugf("Message complete. remaining=%d",
 				len(s.data[s.parseOffset:]))
 

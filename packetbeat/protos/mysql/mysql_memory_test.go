@@ -18,11 +18,14 @@
 package mysql
 
 import (
+	"bytes"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/elastic/beats/v7/libbeat/common"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestAuthenticatedUserKeySurvivesTCPStreamRecreation(t *testing.T) {
@@ -44,6 +47,70 @@ func TestAuthenticatedUserKeySurvivesTCPStreamRecreation(t *testing.T) {
 	}
 	if got := mysql.authenticatedUserKey(&reverse); got != want {
 		t.Fatalf("packet direction must not change authenticated user key")
+	}
+}
+
+func TestLargeResponseMessageKeepsBoundedPrefixAndPacketBoundary(t *testing.T) {
+	for _, kind := range []struct {
+		name   string
+		prefix []byte
+	}{
+		{"ok", []byte{0, 0, 0, 2, 0, 0, 0}},
+		{"error", []byte{0xff, 0x15, 4, '#', 'H', 'Y', '0', '0', '0'}},
+		{"ignored", []byte{0x11}},
+	} {
+		t.Run(kind.name, func(t *testing.T) {
+			payload := bytes.Repeat([]byte{'x'}, 4<<20)
+			copy(payload, kind.prefix)
+			wire := mysqlWirePacket(1, payload)
+			next := mysqlWirePacket(1, []byte{0, 0, 0, 2, 0, 0, 0})
+			stream := newTestMySQLStream(nil, false)
+			const chunkSize = 16 << 10
+			for offset := 0; offset < len(wire); {
+				end := min(offset+chunkSize, len(wire))
+				stream.data = append(stream.data, wire[offset:end]...)
+				last := end == len(wire)
+				if last {
+					stream.data = append(stream.data, next...)
+				}
+				ok, complete := mysqlMessageParser(stream)
+				require.True(t, ok, "valid length-framed response must remain parseable")
+				require.Equal(t, last, complete, "do not complete before all declared bytes have arrived")
+				require.LessOrEqual(t, len(stream.data), maxPayloadSize+len(next), "partial response must not retain its entire payload")
+				require.Less(t, cap(stream.data), 3*maxPayloadSize, "backing allocation must also remain bounded")
+				offset = end
+			}
+			assert.Equal(t, uint64(len(wire)), stream.message.size, "wire byte accounting includes discarded bytes")
+			assert.True(t, stream.message.isTruncated, "bounded payload must be marked truncated")
+			assert.Equal(t, next, stream.data[stream.parseOffset:], "coalesced next response must remain intact")
+			stream.prepareForNewMessage()
+			stream.message = &mysqlMessage{}
+			ok, complete := mysqlMessageParser(stream)
+			assert.True(t, ok, "next response must still parse")
+			assert.True(t, complete, "next response must complete independently")
+		})
+	}
+}
+
+func TestLargeSQLRequestIsNotCompacted(t *testing.T) {
+	payload := append([]byte{mysqlCmdQuery}, bytes.Repeat([]byte{'q'}, 2*maxPayloadSize)...)
+	wire := mysqlWirePacket(0, payload)
+	stream := newTestMySQLStream(wire, true)
+	ok, complete := mysqlMessageParser(stream)
+	require.True(t, ok, "large SQL request must parse")
+	require.True(t, complete, "large SQL request must complete")
+	assert.Equal(t, string(payload[1:]), stream.message.query, "response limits must never truncate SQL text")
+	assert.False(t, stream.message.isTruncated, "client payload must not be discarded")
+}
+
+func TestShortResponseDoesNotReadCoalescedNextPacket(t *testing.T) {
+	for _, payload := range [][]byte{{0}, {0, 0}, {0xff, 1, 0}} {
+		wire := mysqlWirePacket(1, payload)
+		wire = append(wire, mysqlWirePacket(1, []byte{0, 0, 0, 2, 0, 0, 0})...)
+		stream := newTestMySQLStream(wire, false)
+		ok, complete := mysqlMessageParser(stream)
+		assert.False(t, ok, "a complete but malformed response must be rejected without borrowing next-packet bytes")
+		assert.False(t, complete, "a malformed response must not become a transaction")
 	}
 }
 
