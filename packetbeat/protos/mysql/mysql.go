@@ -91,7 +91,9 @@ type mysqlMessage struct {
 	isHandshakeResponse bool
 	isServerGreeting    bool
 	isPrepareResponse   bool
+	isAuthPacket        bool
 	username            string
+	clientTool          string
 
 	direction    uint8
 	isTruncated  bool
@@ -105,19 +107,20 @@ type mysqlMessage struct {
 }
 
 type mysqlTransaction struct {
-	tuple    common.TCPTuple
-	src      common.Endpoint
-	dst      common.Endpoint
-	ts       time.Time
-	endTime  time.Time
-	query    string
-	method   string
-	path     string // for mysql, Path refers to the mysql table queried
-	bytesOut uint64
-	bytesIn  uint64
-	notes    []string
-	isError  bool
-	username string
+	tuple      common.TCPTuple
+	src        common.Endpoint
+	dst        common.Endpoint
+	ts         time.Time
+	endTime    time.Time
+	query      string
+	method     string
+	path       string // for mysql, Path refers to the mysql table queried
+	bytesOut   uint64
+	bytesIn    uint64
+	notes      []string
+	isError    bool
+	username   string
+	clientTool string
 
 	mysql mapstr.M
 
@@ -149,11 +152,19 @@ type mysqlAuthState struct {
 	username                  string
 	clientCapabilities        uint32
 	lastCommand               uint8
+	clientTool                string
+	collectClientInfo         bool
+	pending                   bool
+	encrypted                 bool
+	blocked                   bool
+	nextSequence              uint8
+	authStarted               time.Time
 }
 
 type mysqlConnectionIdentity struct {
 	username           string
 	clientCapabilities uint32
+	clientTool         string
 }
 
 type parseState int
@@ -181,11 +192,14 @@ func (state parseState) String() string {
 type mysqlPlugin struct {
 
 	// config
-	ports        []int
-	maxStoreRows int
-	maxRowLength int
-	sendRequest  bool
-	sendResponse bool
+	ports             []int
+	maxStoreRows      int
+	maxRowLength      int
+	sendRequest       bool
+	sendResponse      bool
+	loginSuccess      bool
+	loginFailure      bool
+	clientInfoEnabled bool
 
 	transactions       *common.Cache
 	transactionTimeout time.Duration
@@ -235,6 +249,9 @@ func New(
 }
 
 func (mysql *mysqlPlugin) init(results protos.Reporter, watcher *procs.ProcessesWatcher, config *mysqlConfig) error {
+	if err := config.Validate(); err != nil {
+		return err
+	}
 	mysql.setFromConfig(config)
 
 	mysql.transactions = common.NewCache(
@@ -269,6 +286,12 @@ func (mysql *mysqlPlugin) setFromConfig(config *mysqlConfig) {
 	mysql.transactionTimeout = config.TransactionTimeout
 	mysql.prepareStatementTimeout = config.StatementTimeout
 	mysql.connectionTimeout = config.ConnectionTimeout
+	mysql.clientInfoEnabled = config.ClientInfo.Enabled
+	mysql.loginSuccess, mysql.loginFailure = false, false
+	for _, outcome := range config.Login.Outcomes {
+		mysql.loginSuccess = mysql.loginSuccess || config.Login.Enabled && outcome == "success"
+		mysql.loginFailure = mysql.loginFailure || config.Login.Enabled && outcome == "failure"
+	}
 }
 
 func (mysql *mysqlPlugin) Close() {
@@ -367,16 +390,21 @@ func (stream *mysqlStream) compactParsedResponse() {
 // Requests are deliberately excluded so query text is never truncated here.
 func (stream *mysqlStream) compactResponseMessage() {
 	message := stream.message
-	if stream.isClient || message == nil || stream.parseState != mysqlStateEatMessage {
+	if message == nil || stream.parseState != mysqlStateEatMessage ||
+		(stream.isClient && !message.isAuthPacket && !message.isHandshakeResponse) {
 		return
+	}
+	limit := maxPayloadSize
+	if message.isAuthPacket || message.isHandshakeResponse || message.isServerGreeting {
+		limit = maxAuthPrefix
 	}
 	remaining := int(message.packetLength) + 4 - message.discardedMessageBytes
 	available := min(len(stream.data)-stream.parseOffset, remaining)
-	discard := available - maxPayloadSize
+	discard := available - limit
 	if discard <= 0 {
 		return
 	}
-	prefixEnd := stream.parseOffset + maxPayloadSize
+	prefixEnd := stream.parseOffset + limit
 	tailStart := stream.parseOffset + available
 	copy(stream.data[prefixEnd:], stream.data[tailStart:])
 	stream.data = stream.data[:len(stream.data)-discard]
@@ -418,16 +446,28 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 		switch s.parseState {
 		case mysqlStateStart:
 			m.start = s.parseOffset
-			if len(s.data[s.parseOffset:]) < 5 {
+			if len(s.data[s.parseOffset:]) < 4 {
 				// A MySQL packet header can span TCP segments. Keep the
 				// buffered bytes and wait for the next segment instead of
 				// dropping this direction of the stream. In particular, dropping
 				// a split Handshake Response loses the authenticated username.
 				return true, false
 			}
-			hdr := s.data[s.parseOffset : s.parseOffset+5]
+			hdr := s.data[s.parseOffset : s.parseOffset+4]
 			m.packetLength = leUint24(hdr[0:3])
 			m.seq = hdr[3]
+			if m.packetLength == 0 {
+				if s.auth != nil && s.auth.pending {
+					m.isAuthPacket, m.ignoreMessage = true, true
+					s.parseState = mysqlStateEatMessage
+					continue
+				}
+				return false, false
+			}
+			if len(s.data[s.parseOffset:]) < 5 {
+				return true, false
+			}
+			hdr = s.data[s.parseOffset : s.parseOffset+5]
 			m.typ = hdr[4]
 			m.isPrepareResponse = !s.isClient && s.auth != nil &&
 				s.auth.lastCommand == mysqlCmdStmtPrepare && m.seq == 1 &&
@@ -442,6 +482,20 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			if !s.isClient && s.auth != nil && m.seq == 0 && (m.typ == 0x09 || m.typ == 0x0a) {
 				m.isServerGreeting = true
 				s.auth.awaitingHandshakeResponse = true
+			}
+			// Authentication packets have different meanings for 0x00/0xfe and
+			// must never enter SQL response parsing, including plugin switches.
+			if s.auth != nil && s.isClient && m.seq == 0 && isRequest(m.typ) {
+				// A missed final auth reply is not evidence of login success.
+				// Still allow SQL parsing once command-phase traffic is observed.
+				s.auth.pending = false
+				s.auth.awaitingHandshakeResponse = false
+			}
+			if m.isServerGreeting || (s.auth != nil && (s.auth.pending ||
+				(!s.isClient && s.auth.awaitingHandshakeResponse))) {
+				m.isAuthPacket, m.ignoreMessage = true, true
+				s.parseState = mysqlStateEatMessage
+				continue
 			}
 
 			if s.isClient {
@@ -504,6 +558,9 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 				}
 				if username, ok := parseHandshakeResponseUsername(s.data[m.start:m.end]); ok {
 					s.auth.username = username
+				}
+				if s.auth.collectClientInfo {
+					s.auth.clientTool = parseClientTool(s.data[m.start:m.end])
 				}
 				// An SSLRequest has no username and is intentionally left empty.
 				s.auth.awaitingHandshakeResponse = false
@@ -745,21 +802,21 @@ type mysqlPrivateData struct {
 func (mysql *mysqlPlugin) messageComplete(tcptuple *common.TCPTuple, dir uint8, stream *mysqlStream) {
 	// all ok, ship it
 	msg := stream.data[stream.message.start:stream.message.end]
-	if stream.message.isServerGreeting {
-		// A server greeting starts a fresh MySQL session, so do not reuse an
-		// identity retained for an older session with the same tuple.
-		mysql.authenticatedUsers.Delete(mysql.authenticatedUserKey(tcptuple))
-		stream.auth.username = ""
-	}
+	mysql.handleAuthentication(tcptuple, stream, msg)
 	if stream.auth != nil {
 		if stream.message.isRequest {
 			stream.auth.lastCommand = stream.message.typ
 		}
 		stream.message.username = stream.auth.username
-		if stream.auth.username != "" {
-			mysql.authenticatedUsers.Put(mysql.authenticatedUserKey(tcptuple), mysqlConnectionIdentity{
-				username: stream.auth.username, clientCapabilities: stream.auth.clientCapabilities,
-			})
+		stream.message.clientTool = stream.auth.clientTool
+		if stream.auth.username != "" && !stream.auth.pending && !stream.auth.blocked && !stream.auth.encrypted {
+			key := mysql.authenticatedUserKey(tcptuple)
+			if mysql.authenticatedUsers.Size() < maxIdentityEntries || mysql.authenticatedUsers.Get(key) != nil {
+				mysql.authenticatedUsers.Put(key, mysqlConnectionIdentity{
+					username: stream.auth.username, clientCapabilities: stream.auth.clientCapabilities,
+					clientTool: stream.auth.clientTool,
+				})
+			}
 		}
 	}
 
@@ -788,11 +845,22 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 		}
 	}
 	if priv.auth == nil {
-		priv.auth = &mysqlAuthState{}
+		priv.auth = &mysqlAuthState{collectClientInfo: mysql.clientInfoEnabled}
 		if identity, ok := mysql.authenticatedUsers.Get(mysql.authenticatedUserKey(tcptuple)).(mysqlConnectionIdentity); ok {
 			priv.auth.username = identity.username
 			priv.auth.clientCapabilities = identity.clientCapabilities
+			priv.auth.clientTool = identity.clientTool
 		}
+	}
+	if priv.auth.encrypted {
+		return priv
+	}
+	if (priv.auth.pending || priv.auth.awaitingHandshakeResponse) &&
+		pkt.Ts.Sub(priv.auth.authStarted) > authTimeout {
+		priv.auth.pending, priv.auth.awaitingHandshakeResponse = false, false
+		priv.auth.blocked = true
+		priv.auth.username, priv.auth.clientTool = "", ""
+		priv.data = [2]*mysqlStream{}
 	}
 
 	if priv.data[dir] == nil {
@@ -838,6 +906,10 @@ func (mysql *mysqlPlugin) Parse(pkt *protos.Packet, tcptuple *common.TCPTuple,
 
 		if complete {
 			mysql.messageComplete(tcptuple, dir, stream)
+			if priv.auth.encrypted {
+				priv.data = [2]*mysqlStream{}
+				break
+			}
 		} else {
 			// wait for more data
 			break
@@ -855,6 +927,12 @@ func (mysql *mysqlPlugin) GapInStream(tcptuple *common.TCPTuple, dir uint8,
 	mysqlData, ok := private.(mysqlPrivateData)
 	if !ok {
 		return private, false
+	}
+	if auth := mysqlData.auth; auth != nil && (auth.pending || auth.awaitingHandshakeResponse) {
+		auth.pending, auth.awaitingHandshakeResponse, auth.blocked = false, false, true
+		auth.username, auth.clientTool = "", ""
+		mysql.authenticatedUsers.Delete(mysql.authenticatedUserKey(tcptuple))
+		return private, true
 	}
 	stream := mysqlData.data[dir]
 	if stream == nil || stream.message == nil {
@@ -912,6 +990,7 @@ func (mysql *mysqlPlugin) receivedMysqlRequest(msg *mysqlMessage) {
 
 	trans.ts = msg.ts
 	trans.username = msg.username
+	trans.clientTool = msg.clientTool
 	trans.src, trans.dst = common.MakeEndpointPair(msg.tcpTuple.BaseTuple, msg.cmdlineTuple)
 	if msg.direction == tcp.TCPDirectionReverse {
 		trans.src, trans.dst = trans.dst, trans.src
@@ -1439,6 +1518,7 @@ func (mysql *mysqlPlugin) publishTransaction(t *mysqlTransaction) {
 	}
 
 	pbf.Event.Dataset = "mysql"
+	pbf.Event.Action = "query"
 	pbf.Event.Start = t.ts
 	pbf.Event.End = t.endTime
 	pbf.Network.Transport = "tcp"
@@ -1449,7 +1529,13 @@ func (mysql *mysqlPlugin) publishTransaction(t *mysqlTransaction) {
 	fields["type"] = pbf.Event.Dataset
 	fields["method"] = t.method
 	fields["query"] = t.query
+	if t.mysql == nil {
+		t.mysql = mapstr.M{}
+	}
 	fields["mysql"] = t.mysql
+	if mysql.clientInfoEnabled {
+		t.mysql["client"] = mapstr.M{"tool": toolOrUnknown(t.clientTool)}
+	}
 	if t.username != "" {
 		fields["user"] = mapstr.M{"name": t.username}
 		pbf.AddUser(t.username)
@@ -1497,7 +1583,7 @@ func parseHandshakeResponseUsername(raw []byte) (string, bool) {
 	}
 
 	end := bytes.IndexByte(raw[usernameOffset:], 0x00)
-	if end <= 0 {
+	if end <= 0 || end > maxIdentityName {
 		return "", false
 	}
 

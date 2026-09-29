@@ -12,6 +12,12 @@ applies_to:
 
 MySQL-specific event fields.
 
+**`mysql.client.tool`**
+:   Client-reported program_name, falling back to _client_name, normalized to uppercase. UNKNOWN if unavailable. This is an unverified connection attribute, not a trusted client identity.
+
+    type: keyword
+
+
 **`mysql.affected_rows`**
 :   If the MySQL command is successful, this field contains the affected number of rows of the last statement.
 

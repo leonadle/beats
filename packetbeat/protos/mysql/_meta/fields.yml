@@ -6,6 +6,13 @@
     - name: mysql
       type: group
       fields:
+        - name: client.tool
+          type: keyword
+          description: >
+            Client-reported program_name, falling back to _client_name,
+            normalized to uppercase. UNKNOWN if unavailable. This is an
+            unverified connection attribute, not a trusted client identity.
+
         - name: affected_rows
           type: long
           description: >
@@ -39,4 +46,3 @@
         - name: error_message
           description: >
             The error info message returned by MySQL.
-

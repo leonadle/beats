@@ -380,6 +380,13 @@ packetbeat.protocols:
   # the MySQL protocol by commenting out the list of ports.
   ports: [3306,3307]
 
+  # Publish initial authentication results. Both features are opt-in.
+  #login:
+  #  enabled: false
+  #  outcomes: [success, failure]
+  #client_info:
+  #  enabled: false
+
   # If this option is enabled, the raw message of the request (`request` field)
   # is sent to Elasticsearch. The default is false.
   #send_request: false

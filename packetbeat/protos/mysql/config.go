@@ -18,18 +18,57 @@
 package mysql
 
 import (
+	"fmt"
 	"time"
 
 	"github.com/elastic/beats/v7/packetbeat/config"
 	"github.com/elastic/beats/v7/packetbeat/protos"
+	conf "github.com/elastic/elastic-agent-libs/config"
 )
 
 type mysqlConfig struct {
 	config.ProtocolCommon `config:",inline"`
-	MaxRowLength          int           `config:"max_row_length"`
-	MaxRows               int           `config:"max_rows"`
-	StatementTimeout      time.Duration `config:"statement_timeout"`
-	ConnectionTimeout     time.Duration `config:"connection_timeout"`
+	MaxRowLength          int                   `config:"max_row_length"`
+	MaxRows               int                   `config:"max_rows"`
+	StatementTimeout      time.Duration         `config:"statement_timeout"`
+	ConnectionTimeout     time.Duration         `config:"connection_timeout"`
+	Login                 mysqlLoginConfig      `config:"login"`
+	ClientInfo            mysqlClientInfoConfig `config:"client_info"`
+}
+
+type mysqlLoginConfig struct {
+	Enabled  bool     `config:"enabled"`
+	Outcomes []string `config:"outcomes"`
+}
+
+type mysqlClientInfoConfig struct {
+	Enabled bool `config:"enabled"`
+}
+
+// Unpack replaces the outcome list instead of merging it with default entries.
+func (c *mysqlLoginConfig) Unpack(from *conf.C) error {
+	type loginValues mysqlLoginConfig
+	var values loginValues
+	if err := from.Unpack(&values); err != nil {
+		return err
+	}
+	if !from.HasField("outcomes") {
+		values.Outcomes = []string{"success", "failure"}
+	}
+	*c = mysqlLoginConfig(values)
+	return nil
+}
+
+func (c *mysqlConfig) Validate() error {
+	if c.Login.Enabled && len(c.Login.Outcomes) == 0 {
+		return fmt.Errorf("mysql.login.outcomes must not be empty when login is enabled")
+	}
+	for _, outcome := range c.Login.Outcomes {
+		if outcome != "success" && outcome != "failure" {
+			return fmt.Errorf("mysql.login.outcomes must contain only success or failure")
+		}
+	}
+	return nil
 }
 
 var defaultConfig = mysqlConfig{
@@ -40,4 +79,5 @@ var defaultConfig = mysqlConfig{
 	MaxRows:           10,
 	StatementTimeout:  3600 * time.Second,
 	ConnectionTimeout: 8 * time.Hour,
+	Login:             mysqlLoginConfig{Outcomes: []string{"success", "failure"}},
 }
