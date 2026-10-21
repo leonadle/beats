@@ -21,6 +21,13 @@ packetbeat.protocols:
 
 ## Configuration options [_configuration_options_8]
 
+Successful prepared-statement creation (`COM_STMT_PREPARE`) populates the SQL
+cache without publishing an access event. Each `COM_STMT_EXECUTE` publishes the
+execution result with `event.action: query`; `mysql.affected_rows` comes from the
+execution response, never the prepared statement ID. Failed preparation remains
+auditable with `event.action: prepare`, `status: Error`, and MySQL error details,
+without an affected-row count.
+
 Also see [Common protocol options](/reference/packetbeat/common-protocol-options.md).
 
 ### `max_rows` [_max_rows]

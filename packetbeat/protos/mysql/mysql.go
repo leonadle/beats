@@ -102,8 +102,11 @@ type mysqlMessage struct {
 	raw          []byte
 	notes        []string
 
-	statementID    int
-	numberOfParams int
+	statementID              int
+	numberOfParams           int
+	prepareMetadataRemaining int
+	prepareColumnsRemaining  int
+	prepareMetadataEOF       bool
 }
 
 type mysqlTransaction struct {
@@ -121,6 +124,7 @@ type mysqlTransaction struct {
 	isError    bool
 	username   string
 	clientTool string
+	command    uint8
 
 	mysql mapstr.M
 
@@ -174,6 +178,7 @@ const (
 	mysqlStateEatMessage
 	mysqlStateEatFields
 	mysqlStateEatRows
+	mysqlStateEatPrepareMetadata
 
 	mysqlStateMax //nolint: unused // used by tests
 )
@@ -183,6 +188,7 @@ var stateStrings = []string{
 	"EatMessage",
 	"EatFields",
 	"EatRows",
+	"EatPrepareMetadata",
 }
 
 func (state parseState) String() string {
@@ -371,7 +377,8 @@ func (stream *mysqlStream) reportLargeBuffer() {
 // compactParsedResponse bounds the per-connection buffer while a large result set is still in flight.
 func (stream *mysqlStream) compactParsedResponse() {
 	message := stream.message
-	if stream.parseState != mysqlStateEatRows || message == nil || message.end == 0 ||
+	if (stream.parseState != mysqlStateEatRows && stream.parseState != mysqlStateEatPrepareMetadata) ||
+		message == nil || message.end == 0 ||
 		stream.parseOffset-message.end < mysqlStreamCompactThreshold {
 		return
 	}
@@ -381,6 +388,9 @@ func (stream *mysqlStream) compactParsedResponse() {
 	copy(data, stream.data[:message.end])
 	copy(data[message.end:], tail)
 	stream.data = data
+	if stream.parseState == mysqlStateEatPrepareMetadata {
+		message.discardedMessageBytes += stream.parseOffset - message.end
+	}
 	stream.parseOffset = message.end
 }
 
@@ -579,6 +589,11 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 					}
 					m.query = string(s.data[m.start+5 : m.end])
 				}
+			} else if m.isPrepareResponse {
+				// PREPARE_OK has a fixed-width statement ID, not affected rows.
+				m.statementID = int(binary.LittleEndian.Uint32(s.data[m.start+5:]))
+				m.numberOfFields = int(binary.LittleEndian.Uint16(s.data[m.start+9:]))
+				m.numberOfParams = int(binary.LittleEndian.Uint16(s.data[m.start+11:]))
 			} else if m.isOK {
 				// affected rows
 				affectedRows, off, complete, err := readLinteger(s.data[:m.end], m.start+5)
@@ -630,19 +645,55 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 			// Packet length alone cannot distinguish PREPARE_OK from an
 			// ordinary OK packet carrying a five-byte info string.
 			if m.isPrepareResponse {
-				m.statementID = int(binary.LittleEndian.Uint32(s.data[m.start+5:]))
-				m.numberOfFields = int(binary.LittleEndian.Uint16(s.data[m.start+9:]))
-				m.numberOfParams = int(binary.LittleEndian.Uint16(s.data[m.start+11:]))
-				if m.numberOfFields > 0 {
-					s.parseState = mysqlStateEatFields
-				} else if m.numberOfParams > 0 {
-					s.parseState = mysqlStateEatRows
+				// Parameter definitions precede column definitions. Neither block
+				// contains result rows; each has its own legacy EOF terminator.
+				m.prepareMetadataRemaining = m.numberOfParams
+				if m.numberOfParams > 0 {
+					m.prepareColumnsRemaining = m.numberOfFields
 				} else {
+					m.prepareMetadataRemaining = m.numberOfFields
+				}
+				if m.prepareMetadataRemaining == 0 {
 					return true, true
 				}
+				s.parseState = mysqlStateEatPrepareMetadata
 			} else {
 				return true, true
 			}
+		case mysqlStateEatPrepareMetadata:
+			if len(s.data[s.parseOffset:]) < 4 {
+				return true, false
+			}
+			length := int(leUint24(s.data[s.parseOffset:]))
+			if length == 0 {
+				return false, false
+			}
+			if len(s.data[s.parseOffset:]) < length+4 {
+				return true, false
+			}
+			if m.prepareMetadataEOF {
+				if length >= 9 || s.data[s.parseOffset+4] != 0xfe {
+					return false, false
+				}
+				m.prepareMetadataEOF = false
+			} else {
+				m.prepareMetadataRemaining--
+				if m.prepareMetadataRemaining == 0 && s.auth.clientCapabilities&clientDeprecateEOF == 0 {
+					m.prepareMetadataEOF = true
+				}
+			}
+			s.parseOffset += length + 4
+			if m.prepareMetadataRemaining == 0 && !m.prepareMetadataEOF {
+				if m.prepareColumnsRemaining > 0 {
+					m.prepareMetadataRemaining = m.prepareColumnsRemaining
+					m.prepareColumnsRemaining = 0
+				} else {
+					m.end = s.parseOffset
+					m.size = uint64(m.end - m.start + m.discardedMessageBytes)
+					return true, true
+				}
+			}
+			s.compactParsedResponse()
 		case mysqlStateEatFields:
 			if len(s.data[s.parseOffset:]) < 4 {
 				// wait for more
@@ -776,7 +827,7 @@ func mysqlMessageParser(s *mysqlStream) (bool, bool) {
 func (mysql *mysqlPlugin) messageGap(s *mysqlStream, nbytes int) (complete bool) {
 	m := s.message
 	switch s.parseState {
-	case mysqlStateStart, mysqlStateEatMessage:
+	case mysqlStateStart, mysqlStateEatMessage, mysqlStateEatPrepareMetadata:
 		// not enough data yet to be useful
 		return false
 	case mysqlStateEatFields, mysqlStateEatRows:
@@ -989,6 +1040,7 @@ func (mysql *mysqlPlugin) receivedMysqlRequest(msg *mysqlMessage) {
 	}
 
 	trans.ts = msg.ts
+	trans.command = msg.typ
 	trans.username = msg.username
 	trans.clientTool = msg.clientTool
 	trans.src, trans.dst = common.MakeEndpointPair(msg.tcpTuple.BaseTuple, msg.cmdlineTuple)
@@ -998,7 +1050,7 @@ func (mysql *mysqlPlugin) receivedMysqlRequest(msg *mysqlMessage) {
 
 	// try to get query string for Execute statement from cache
 	// and delete statement id for Close statement from cache
-	if msg.statementID != 0 {
+	if msg.typ == mysqlCmdStmtExecute || msg.typ == mysqlCmdStmtClose {
 		trans.statementID = msg.statementID
 		stmts := mysql.getStmtsMap(msg.tcpTuple.Hashable())
 		if stmts == nil {
@@ -1072,34 +1124,34 @@ func (mysql *mysqlPlugin) receivedMysqlResponse(msg *mysqlMessage) {
 		return
 
 	}
-	// save json details
-	trans.mysql.Update(mapstr.M{
-		"affected_rows": msg.affectedRows,
-		"insert_id":     msg.insertID,
-		"num_rows":      msg.numberOfRows,
-		"num_fields":    msg.numberOfFields,
-	})
-	trans.isError = msg.isError
-	if trans.isError {
-		trans.mysql["error_code"] = msg.errorCode
-		trans.mysql["error_message"] = msg.errorInfo
-	}
-	if msg.statementID != 0 {
+	if msg.isPrepareResponse {
 		// cache prepare statement response info
 		stmts := mysql.getStmtsMap(msg.tcpTuple.Hashable())
 		if stmts == nil {
 			stmts = mysqlStmtMap{}
 		}
-		if stmts[msg.statementID] == nil {
-			stmtData := &mysqlStmtData{
-				query:           trans.query,
-				numOfParameters: msg.numberOfParams,
-			}
-			stmts[msg.statementID] = stmtData
+		stmts[msg.statementID] = &mysqlStmtData{
+			query:           trans.query,
+			numOfParameters: msg.numberOfParams,
 		}
 		mysql.prepareStatements.Put(msg.tcpTuple.Hashable(), stmts)
-		trans.notes = append(trans.notes, trans.query)
-		trans.query = "Request Prepare Statement"
+		// Preparing a statement does not execute SQL. Only EXECUTE publishes
+		// an access event; successful PREPARE just populates the SQL cache.
+		mysql.transactions.Delete(trans.tuple.Hashable())
+		return
+	}
+	if trans.command != mysqlCmdStmtPrepare {
+		trans.mysql.Update(mapstr.M{
+			"affected_rows": msg.affectedRows,
+			"insert_id":     msg.insertID,
+			"num_rows":      msg.numberOfRows,
+			"num_fields":    msg.numberOfFields,
+		})
+	}
+	trans.isError = msg.isError
+	if trans.isError {
+		trans.mysql["error_code"] = msg.errorCode
+		trans.mysql["error_message"] = msg.errorInfo
 	}
 
 	trans.bytesOut = msg.size
@@ -1519,6 +1571,9 @@ func (mysql *mysqlPlugin) publishTransaction(t *mysqlTransaction) {
 
 	pbf.Event.Dataset = "mysql"
 	pbf.Event.Action = "query"
+	if t.command == mysqlCmdStmtPrepare {
+		pbf.Event.Action = "prepare"
+	}
 	pbf.Event.Start = t.ts
 	pbf.Event.End = t.endTime
 	pbf.Network.Transport = "tcp"
